@@ -1,0 +1,235 @@
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import torchvision.utils as vutils
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+from torchvision.models import inception_v3, Inception_V3_Weights
+from torchvision.transforms.functional import to_pil_image
+from medmnist import PneumoniaMNIST
+from scipy.linalg import sqrtm
+
+# Check device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Data transformation and loading
+data_transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5], std=[0.5])
+])
+
+train_dataset = PneumoniaMNIST(split="train", download=True, transform=data_transform)
+test_dataset = PneumoniaMNIST(split="test", download=True, transform=data_transform)
+train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+
+# Generator network
+class Generator(nn.Module):
+    def __init__(self, latent_dim):
+        super(Generator, self).__init__()
+        self.model = nn.Sequential(
+            nn.Linear(latent_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 256),
+            nn.ReLU(),
+            nn.Linear(256, 512),
+            nn.ReLU(),
+            nn.Linear(512, 28 * 28),
+            nn.Tanh()
+        )
+
+    def forward(self, z):
+        return self.model(z).view(-1, 1, 28, 28)
+
+# Discriminator network
+class Discriminator(nn.Module):
+    def __init__(self):
+        super(Discriminator, self).__init__()
+        self.model = nn.Sequential(
+            nn.Linear(28 * 28, 512),
+            nn.LeakyReLU(0.2),
+            nn.Linear(512, 256),
+            nn.LeakyReLU(0.2),
+            nn.Linear(256, 1)
+        )
+
+    def forward(self, x):
+        return self.model(x.view(-1, 28 * 28))
+
+# Visualization helper
+
+def display_images(images, epoch, gan_type):
+    images = images.cpu().detach()
+    grid = vutils.make_grid(images[:16], normalize=True)
+    plt.figure(figsize=(8, 8))
+    plt.imshow(grid.permute(1, 2, 0))
+    plt.title(f"{gan_type} - Epoch {epoch}")
+    plt.axis("off")
+    plt.show()
+
+# Inception Score computation
+def inception_score(generator, latent_dim, num_samples=5000, batch_size=50, splits=10):
+    generator.eval()
+    inception_model = inception_v3(weights=Inception_V3_Weights.IMAGENET1K_V1, transform_input=False).to(device)
+    inception_model.eval()
+
+    transform = transforms.Compose([
+        transforms.Resize((299, 299))
+    ])
+
+    preds = []
+    for _ in range(num_samples // batch_size):
+        z = torch.randn(batch_size, latent_dim).to(device)
+        with torch.no_grad():
+            fake_images = generator(z)
+
+        if fake_images.shape[1] == 1:
+            fake_images = fake_images.repeat(1, 3, 1, 1)
+
+        fake_images = torch.stack([transform(img.cpu()) for img in fake_images]).to(device)
+
+        with torch.no_grad():
+            logits = inception_model(fake_images)
+            preds.append(F.softmax(logits, dim=1).cpu().numpy())
+
+    preds = np.concatenate(preds, axis=0)
+    split_scores = []
+    for k in np.array_split(preds, splits):
+        kl_div = k * (np.log(k) - np.log(np.mean(k, axis=0, keepdims=True)))
+        split_scores.append(np.exp(np.mean(np.sum(kl_div, axis=1))))
+
+    return np.mean(split_scores), np.std(split_scores)
+
+# FID computation
+def calculate_fid(real_images, fake_images):
+    mu_real, sigma_real = np.mean(real_images, axis=0), np.cov(real_images, rowvar=False)
+    mu_fake, sigma_fake = np.mean(fake_images, axis=0), np.cov(fake_images, rowvar=False)
+    fid = np.sum((mu_real - mu_fake) ** 2) + np.trace(sigma_real + sigma_fake - 2 * sqrtm(sigma_real @ sigma_fake))
+    return np.real(fid)
+
+# LSGAN training
+def train_ls_gan(generator, discriminator, dataloader, epochs=50, latent_dim=100, lr=0.0002):
+    generator.to(device)
+    discriminator.to(device)
+    optimizer_G = optim.Adam(generator.parameters(), lr=lr, betas=(0.5, 0.999))
+    optimizer_D = optim.Adam(discriminator.parameters(), lr=lr, betas=(0.5, 0.999))
+    criterion = nn.MSELoss()
+    writer = SummaryWriter("runs/LS-GAN")
+
+    for epoch in range(epochs):
+        for i, (real_images, _) in enumerate(dataloader):
+            real_images = real_images.to(device)
+            batch_size = real_images.shape[0]
+            z = torch.randn(batch_size, latent_dim, device=device)
+            fake_images = generator(z)
+
+            optimizer_D.zero_grad()
+            real_preds = discriminator(real_images).squeeze()
+            fake_preds = discriminator(fake_images.detach()).squeeze()
+            d_loss = 0.5 * torch.mean((real_preds - 1) ** 2) + 0.5 * torch.mean(fake_preds ** 2)
+            d_loss.backward()
+            optimizer_D.step()
+
+            optimizer_G.zero_grad()
+            fake_preds = discriminator(fake_images).squeeze()
+            g_loss = 0.5 * torch.mean((fake_preds - 1) ** 2)
+            g_loss.backward()
+            optimizer_G.step()
+
+        if epoch % 5 == 0:
+            display_images(fake_images, epoch, "LS-GAN")
+
+    writer.close()
+
+# WGAN training
+def train_wgan(generator, discriminator, dataloader, epochs=50, latent_dim=100, lr=0.0002):
+    generator.to(device)
+    discriminator.to(device)
+    optimizer_G = optim.Adam(generator.parameters(), lr=lr, betas=(0.5, 0.999))
+    optimizer_D = optim.Adam(discriminator.parameters(), lr=lr, betas=(0.5, 0.999))
+
+    for epoch in range(epochs):
+        for i, (real_images, _) in enumerate(dataloader):
+            real_images = real_images.to(device)
+            batch_size = real_images.shape[0]
+            z = torch.randn(batch_size, latent_dim, device=device)
+            fake_images = generator(z)
+
+            optimizer_D.zero_grad()
+            real_preds = discriminator(real_images).squeeze()
+            fake_preds = discriminator(fake_images.detach()).squeeze()
+            d_loss = -torch.mean(real_preds) + torch.mean(fake_preds)
+            d_loss.backward()
+            optimizer_D.step()
+
+            optimizer_G.zero_grad()
+            fake_preds = discriminator(fake_images).squeeze()
+            g_loss = -torch.mean(fake_preds)
+            g_loss.backward()
+            optimizer_G.step()
+
+        if epoch % 5 == 0:
+            display_images(fake_images, epoch, "WGAN")
+
+# WGAN-GP training
+def train_wgan_gp(generator, discriminator, dataloader, epochs=50, latent_dim=100, lr=0.0002):
+    generator.to(device)
+    discriminator.to(device)
+    optimizer_G = optim.Adam(generator.parameters(), lr=lr, betas=(0.5, 0.999))
+    optimizer_D = optim.Adam(discriminator.parameters(), lr=lr, betas=(0.5, 0.999))
+    lambda_gp = 10
+
+    for epoch in range(epochs):
+        for i, (real_images, _) in enumerate(dataloader):
+            real_images = real_images.to(device)
+            batch_size = real_images.shape[0]
+            z = torch.randn(batch_size, latent_dim, device=device)
+            fake_images = generator(z)
+
+            optimizer_D.zero_grad()
+            real_preds = discriminator(real_images).squeeze()
+            fake_preds = discriminator(fake_images.detach()).squeeze()
+
+            epsilon = torch.rand(batch_size, 1, 1, 1, device=device)
+            interpolated = epsilon * real_images + (1 - epsilon) * fake_images.detach()
+            interpolated.requires_grad_(True)
+            interp_preds = discriminator(interpolated).squeeze()
+            gradients = torch.autograd.grad(outputs=interp_preds, inputs=interpolated,
+                                            grad_outputs=torch.ones_like(interp_preds),
+                                            create_graph=True, retain_graph=True)[0]
+            gradient_penalty = ((gradients.view(batch_size, -1).norm(2, dim=1) - 1) ** 2).mean()
+
+            d_loss = -torch.mean(real_preds) + torch.mean(fake_preds) + lambda_gp * gradient_penalty
+            d_loss.backward()
+            optimizer_D.step()
+
+            optimizer_G.zero_grad()
+            fake_preds = discriminator(fake_images).squeeze()
+            g_loss = -torch.mean(fake_preds)
+            g_loss.backward()
+            optimizer_G.step()
+
+        if epoch % 5 == 0:
+            display_images(fake_images, epoch, "WGAN-GP")
+
+# Initialize networks for each GAN
+latent_dim = 100
+generator_LSGAN = Generator(latent_dim).to(device)
+discriminator_LSGAN = Discriminator().to(device)
+
+generator_WGAN = Generator(latent_dim).to(device)
+discriminator_WGAN = Discriminator().to(device)
+
+generator_WGAN_GP = Generator(latent_dim).to(device)
+discriminator_WGAN_GP = Discriminator().to(device)
+
+# Example: Train LSGAN
+train_ls_gan(generator_LSGAN, discriminator_LSGAN, train_loader, epochs=50, latent_dim=latent_dim)
+
+# You can similarly train WGAN and WGAN-GP with:
+# train_wgan(generator_WGAN, discriminator_WGAN, train_loader, epochs=50, latent_dim=latent_dim)
+# train_wgan_gp(generator_WGAN_GP, discriminator_WGAN_GP, train_loader, epochs=50, latent_dim=latent_dim)
