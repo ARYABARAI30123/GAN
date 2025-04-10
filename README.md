@@ -1,4 +1,4 @@
-# GAN
+
 # GAN on MedMNIST Dataset
 
 This project implements a Generative Adversarial Network (GAN) using PyTorch to generate synthetic images based on the MedMNIST dataset. The architecture includes a basic generator and discriminator, and the model is trained on the `PathMNIST` subset of MedMNIST.
